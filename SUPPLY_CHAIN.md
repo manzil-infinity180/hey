@@ -158,12 +158,17 @@ separate `promote.yml` fetches the attestations and blocks deploy on policy fail
 
 ### A note on secretscan + `--trace`
 
-In the `build` step, secretscan scans the **traced build's materials** — which
-include files the Go toolchain/stdlib touched (e.g. `crypto/tls/testdata` PEM keys).
-That can surface a finding that has nothing to do with *your* code, which is why this
-workflow records (doesn't hard-fail on) secretscan here. For a real fail-closed secret
-gate, scope it to your source tree (a Gitleaks allowlist for toolchain/`testdata`
-paths) rather than a fully-traced build.
+In the `build` step, secretscan scans the **traced build's materials/products** —
+which include **transient compiled artifacts** the Go toolchain creates (object files,
+the linked binary, `/tmp/go-build*`). Pattern/entropy matches inside those binaries are
+**false positives that flip run-to-run** (one run flagged 1, the next flagged 0). That's
+why this workflow *records* — rather than hard-fails on — secretscan here. For a real
+fail-closed secret gate, scan your **source tree** (not a fully-traced build), e.g. with
+a Gitleaks allowlist for build/`testdata` paths.
+
+> Aside (upstream bug worth reporting): when secretscan matches **binary** content it
+> embeds raw bytes in the DSSE payload, making the decoded statement technically invalid
+> JSON (`jq` chokes on the unescaped control characters).
 
 ### Tracing in CI is **ptrace**, not eBPF
 
