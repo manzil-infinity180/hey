@@ -124,18 +124,36 @@ jq -r .payload build.att.json | base64 -d \
 
 ## Part 2 — CI testing (GitHub Actions)
 
-`.github/workflows/supply-chain.yml` adds an attested build to CI using the
-official [`cilock-action`](https://github.com/aflock-ai/cilock-action). It:
+`.github/workflows/supply-chain.yml` wraps a whole Go supply-chain pipeline with
+the official [`cilock-action`](https://github.com/aflock-ai/cilock-action) — each
+real tool is wrapped by cilock, so each emits its own signed attestation:
 
-1. checks out the repo and sets up Go,
-2. generates an **ephemeral** ed25519 signing key (per-run, never committed),
-3. runs `go build` **wrapped by cilock** with tracing on, capturing
-   `environment git github secretscan` + the process tree, signed to
-   `build.attestation.json`,
-4. decodes the DSSE payload and prints a summary to the job summary,
-5. uploads the attestation as a build artifact.
+| Step | Tool wrapped | Attestor(s) | What it proves |
+|---|---|---|---|
+| `build` | `go build` | environment, git, github, **secretscan** | attested build + **secret gate** (`--attestor-secretscan-fail-on-detection`) |
+| `govulncheck` | `govulncheck` | …, **sarif** | Go call-graph vulnerability scan (reachability) |
+| `gosec` | `gosec` | …, **sarif** | Go SAST findings |
+| `sbom` | `syft` | …, **sbom** | CycloneDX SBOM of the built binary |
+| `trivy` | `trivy fs` | …, **sarif** | filesystem vulnerability scan |
 
-It runs on every push/PR to `master` (and via **Run workflow** / `workflow_dispatch`).
+It also: generates an **ephemeral** ed25519 signing key (per-run, never committed),
+prints a per-step summary table to the job summary, runs a lightweight **policy
+gate** (zero secretscan findings + required attestations present — soft "observe"
+mode by default), and uploads every attestation as an artifact. Runs on push/PR to
+`master` and via **Run workflow** (`workflow_dispatch`).
+
+Why all scanners use the `sarif` attestor: gosec/govulncheck/trivy all emit SARIF,
+and `sarif` ships in the action's default binary (the dedicated `trivy`/`govulncheck`
+attestors may not). `secretscan` and `sbom` ship too. The action's `cilock-args`
+only passes **secretscan** flags through — other `--attestor-*` flags are ignored.
+
+### Make the gate fail-closed
+
+The `policy gate` step is `continue-on-error: true` (observe). To enforce it, set
+that to `false` — or replace it with a real `cilock verify` against a signed
+Witness policy (see Part 3 + the `release-promotion-gate` / `verify-in-a-release-gate`
+docs), which is the production pattern: a separate `promote.yml` fetches the
+attestations and blocks deploy on policy failure.
 
 ### Tracing in CI is **ptrace**, not eBPF
 

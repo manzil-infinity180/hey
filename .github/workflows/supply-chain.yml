@@ -1,13 +1,19 @@
 # Supply-chain attestation with cilock (CI/lock).
 #
-# Wraps the real `go build` with cilock: records the build environment, git
-# state, the GitHub context, a trace of the process tree, every file touched,
-# and signs the result as an in-toto / DSSE attestation you can gate releases on.
+# Each real CI tool (build, vuln scan, SAST, SBOM, fs scan) is WRAPPED by cilock,
+# which records the environment, git/github context, the traced process tree, the
+# input materials + output products, and signs the result as an in-toto / DSSE
+# attestation you can gate releases on. Every step emits its own signed envelope.
 #
 # IMPORTANT: the cilock-ACTION traces with ptrace (it runs the rookery library
 # in-process). For kernel-side eBPF tracing — the full file + network capture —
 # run the cilock BINARY directly with CAP_BPF on a Linux host. See SUPPLY_CHAIN.md
 # → "Local testing (real eBPF)".
+#
+# NOTE on attestors: scanners (govulncheck/gosec/trivy) are captured via the
+# universal `sarif` attestor (their SARIF output), which ships in the default
+# action binary. `secretscan` and `sbom` ship too. `cilock-args` only passes
+# secretscan flags through — other --attestor-* flags are ignored by the action.
 name: supply-chain
 
 on:
@@ -24,6 +30,9 @@ permissions:
 jobs:
   attested-build:
     runs-on: ubuntu-latest
+    env:
+      ATT_DIR: ${{ github.workspace }}/attestations
+      CILOCK_ACTION: aflock-ai/cilock-action@v1.0.4   # exact tag: @v1 has no release assets
     steps:
       - uses: actions/checkout@v4
 
@@ -32,47 +41,123 @@ jobs:
         with:
           go-version: stable
 
+      - name: Install scanners (govulncheck, gosec, syft, trivy)
+        run: |
+          mkdir -p "$ATT_DIR" "$HOME/.local/bin"
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh   | sh -s -- -b "$HOME/.local/bin"
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       # Ephemeral signing key — generated per run, NEVER committed. Keeps this
-      # demo self-contained (no external signing account needed). For real use,
-      # prefer the keyless-sigstore variant documented in SUPPLY_CHAIN.md.
+      # demo self-contained (no external signing account). For production, drop
+      # the three signing inputs to use keyless Sigstore (needs id-token: write).
       - name: Generate ephemeral signing key
         run: openssl genpkey -algorithm ed25519 -out signing.key
 
-      - name: Attested build (cilock)
-        # Pin to an exact release tag: the floating @v1 tag has no published
-        # release assets yet, so the binary download 404s. Use @v1.0.4.
+      # 1) Attested build + secret gate (fails the build if a credential leaks)
+      - name: build + secret gate (cilock)
         uses: aflock-ai/cilock-action@v1.0.4
         with:
           step: build
-          # environment + git + github context, plus a secret scan of the tree.
           attestations: "environment git github secretscan"
-          trace: "true"                  # ptrace of the build's process tree
-          key: signing.key               # sign with the ephemeral key above
-          enable-sigstore: "false"       # using the file key, not keyless
-          enable-archivista: "false"     # off until the platform free tier is bound
-          outfile: ${{ github.workspace }}/build.attestation.json
+          trace: "true"
+          cilock-args: "--attestor-secretscan-fail-on-detection"
+          key: signing.key
+          enable-sigstore: "false"
+          enable-archivista: "false"
+          outfile: ${{ env.ATT_DIR }}/build.attestation.json
           command: "go build -o bin/hey ."
 
-      # ── Keyless alternative (no key file; signs via GitHub OIDC + Sigstore) ──
-      # Delete the three signing inputs above (key / enable-sigstore /
-      # enable-archivista) to fall back to the action's keyless defaults, which
-      # use the `id-token: write` permission already granted on this job.
+      # 2) Go vulnerability scan (call-graph reachability) → SARIF
+      - name: govulncheck (cilock)
+        uses: aflock-ai/cilock-action@v1.0.4
+        with:
+          step: govulncheck
+          attestations: "environment git github sarif"
+          key: signing.key
+          enable-sigstore: "false"
+          enable-archivista: "false"
+          outfile: ${{ env.ATT_DIR }}/govulncheck.attestation.json
+          # govulncheck (v1.x) writes SARIF to stdout; non-zero exit on findings,
+          # so `|| true` keeps the step green — the gate is the policy, not exit code.
+          command: "sh -c 'govulncheck -format sarif ./... > govulncheck.sarif || true'"
 
-      - name: Inspect the signed attestation
+      # 3) Go SAST → SARIF (-no-fail so findings don't fail the wrapped command)
+      - name: gosec (cilock)
+        uses: aflock-ai/cilock-action@v1.0.4
+        with:
+          step: gosec
+          attestations: "environment git github sarif"
+          key: signing.key
+          enable-sigstore: "false"
+          enable-archivista: "false"
+          outfile: ${{ env.ATT_DIR }}/gosec.attestation.json
+          command: "gosec -no-fail -fmt=sarif -out=gosec.sarif ./..."
+
+      # 4) SBOM of the built binary (CycloneDX) → sbom attestor
+      - name: sbom (cilock)
+        uses: aflock-ai/cilock-action@v1.0.4
+        with:
+          step: sbom
+          attestations: "environment git github sbom"
+          key: signing.key
+          enable-sigstore: "false"
+          enable-archivista: "false"
+          outfile: ${{ env.ATT_DIR }}/sbom.attestation.json
+          command: "syft bin/hey -o cyclonedx-json=sbom.cdx.json"
+
+      # 5) Filesystem vulnerability scan → SARIF
+      - name: trivy fs (cilock)
+        uses: aflock-ai/cilock-action@v1.0.4
+        with:
+          step: trivy
+          attestations: "environment git github sarif"
+          key: signing.key
+          enable-sigstore: "false"
+          enable-archivista: "false"
+          outfile: ${{ env.ATT_DIR }}/trivy.attestation.json
+          command: "trivy fs --scanners vuln --format sarif --output trivy.sarif ."
+
+      - name: Summarize attestations
+        if: always()
         run: |
-          F=build.attestation.json
-          echo "### cilock attestation" >> "$GITHUB_STEP_SUMMARY"
-          echo "DSSE signatures: $(jq '.signatures | length' "$F")"
-          # The real statement is base64 inside .payload — decode before reading.
-          jq -r .payload "$F" | base64 -d | jq -c '{
-            predicateType,
-            step: .predicate.name,
-            attestations: [.predicate.attestations[].type | sub(".*/attestations/"; "")],
-            processes_traced: ([.predicate.attestations[] | select(.type|test("command-run"))][0].attestation.processes | length)
-          }' | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### cilock supply-chain attestations"
+            echo
+            echo "| step | sigs | attestors | procs traced |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in "$ATT_DIR"/*.attestation.json; do
+            [ -s "$f" ] || continue
+            sigs=$(jq '.signatures | length' "$f")
+            pl=$(jq -r .payload "$f" | base64 -d)
+            step=$(echo "$pl" | jq -r '.predicate.name')
+            atts=$(echo "$pl" | jq -rc '[.predicate.attestations[].type | sub(".*/attestations/";"") | sub("/v.*";"")] | join(", ")')
+            procs=$(echo "$pl" | jq -r '([.predicate.attestations[] | select(.type|test("command-run"))][0].attestation.processes | length) // 0')
+            echo "| $step | $sigs | $atts | $procs |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          cat "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload attestation
+      # Lightweight release gate (dependency-free). Soft "observe" mode for now —
+      # set continue-on-error: false to make it fail-closed (see SUPPLY_CHAIN.md),
+      # or replace with `cilock verify` against a signed Witness policy.
+      - name: policy gate (observe)
+        continue-on-error: true
+        run: |
+          pl=$(jq -r .payload "$ATT_DIR/build.attestation.json" | base64 -d)
+          findings=$(echo "$pl" | jq '([.predicate.attestations[] | select(.type|test("secretscan"))][0].attestation.findings | length) // 0')
+          echo "secretscan findings: $findings"
+          [ "$findings" = "0" ] || { echo "::error::secret leak detected ($findings findings)"; exit 1; }
+          echo "$pl" | jq -e '[.predicate.attestations[].type] | (any(test("command-run")) and any(test("product")))' >/dev/null \
+            && echo "gate: required attestations (command-run + product) present" \
+            || { echo "::error::missing required attestations"; exit 1; }
+
+      - name: Upload attestations
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-attestation
-          path: build.attestation.json
+          name: supply-chain-attestations
+          path: ${{ env.ATT_DIR }}/*.attestation.json
