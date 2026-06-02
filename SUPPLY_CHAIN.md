@@ -130,30 +130,40 @@ real tool is wrapped by cilock, so each emits its own signed attestation:
 
 | Step | Tool wrapped | Attestor(s) | What it proves |
 |---|---|---|---|
-| `build` | `go build` | environment, git, github, **secretscan** | attested build + **secret gate** (`--attestor-secretscan-fail-on-detection`) |
+| `build` | `go build` | environment, git, github, **secretscan** | attested build (process tree traced); secretscan **records** findings (observe) |
 | `govulncheck` | `govulncheck` | …, **sarif** | Go call-graph vulnerability scan (reachability) |
 | `gosec` | `gosec` | …, **sarif** | Go SAST findings |
 | `sbom` | `syft` | …, **sbom** | CycloneDX SBOM of the built binary |
 | `trivy` | `trivy fs` | …, **sarif** | filesystem vulnerability scan |
 
-It also: generates an **ephemeral** ed25519 signing key (per-run, never committed),
-prints a per-step summary table to the job summary, runs a lightweight **policy
-gate** (zero secretscan findings + required attestations present — soft "observe"
-mode by default), and uploads every attestation as an artifact. Runs on push/PR to
-`master` and via **Run workflow** (`workflow_dispatch`).
+It also: signs **keyless via Sigstore** (public-good Fulcio + GitHub OIDC — no keys,
+no TestifySec account), prints a per-step summary table to the job summary, runs a
+**fail-closed policy gate** (the build attestation must carry `command-run` +
+`product` + `github`; secretscan findings are reported as informational), and uploads
+every attestation as an artifact. Runs on push/PR to `master` and via **Run workflow**.
 
 Why all scanners use the `sarif` attestor: gosec/govulncheck/trivy all emit SARIF,
 and `sarif` ships in the action's default binary (the dedicated `trivy`/`govulncheck`
 attestors may not). `secretscan` and `sbom` ship too. The action's `cilock-args`
 only passes **secretscan** flags through — other `--attestor-*` flags are ignored.
 
-### Make the gate fail-closed
+### The release gate
 
-The `policy gate` step is `continue-on-error: true` (observe). To enforce it, set
-that to `false` — or replace it with a real `cilock verify` against a signed
-Witness policy (see Part 3 + the `release-promotion-gate` / `verify-in-a-release-gate`
-docs), which is the production pattern: a separate `promote.yml` fetches the
-attestations and blocks deploy on policy failure.
+The `policy gate` step is **fail-closed**: it blocks the job unless the build
+attestation carries the core evidence (`command-run` + `product` + `github`). To make
+it stricter (also fail on secretscan findings, or on high-severity SARIF results), or
+to do it properly, replace it with `cilock verify` against a signed Witness policy
+(see Part 3 + the `release-promotion-gate` / `verify-in-a-release-gate` docs): a
+separate `promote.yml` fetches the attestations and blocks deploy on policy failure.
+
+### A note on secretscan + `--trace`
+
+In the `build` step, secretscan scans the **traced build's materials** — which
+include files the Go toolchain/stdlib touched (e.g. `crypto/tls/testdata` PEM keys).
+That can surface a finding that has nothing to do with *your* code, which is why this
+workflow records (doesn't hard-fail on) secretscan here. For a real fail-closed secret
+gate, scope it to your source tree (a Gitleaks allowlist for toolchain/`testdata`
+paths) rather than a fully-traced build.
 
 ### Tracing in CI is **ptrace**, not eBPF
 
@@ -171,14 +181,13 @@ auto-falls-back to ptrace and records which backend produced the evidence.)
 
 ### Signing options
 
-- **Ephemeral key (default here)** — self-contained, zero external accounts.
-  Good for proving the mechanism.
-- **Keyless (Sigstore + GitHub OIDC)** — delete the three signing inputs
-  (`key` / `enable-sigstore` / `enable-archivista`) to use the action's keyless
-  defaults; the `id-token: write` permission is already set.
-- **Upload to the platform (Archivista)** — `enable-archivista` is off because
-  the TestifySec **free tier isn't bound yet**. Once it is (`cilock login`),
-  flip it to `true` to store/centralize attestations.
+- **Keyless Sigstore (default here)** — each step signs via **public-good Fulcio**
+  (`fulcio-url: https://fulcio.sigstore.dev`) using the workflow's GitHub OIDC token
+  (`id-token: write`) + a public Sigstore timestamp. No keys to manage, no account.
+- **File key** — set `key:` to a PEM path and `enable-sigstore: false` for an
+  air-gapped / self-contained signer (what the local guide uses).
+- **TestifySec platform (Archivista)** — `enable-archivista` is off here. Once the
+  **free tier is bound** (`cilock login`), flip it to `true` to centralize evidence.
 
 ---
 
