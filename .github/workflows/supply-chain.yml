@@ -1,0 +1,76 @@
+# Supply-chain attestation with cilock (CI/lock).
+#
+# Wraps the real `go build` with cilock: records the build environment, git
+# state, the GitHub context, a trace of the process tree, every file touched,
+# and signs the result as an in-toto / DSSE attestation you can gate releases on.
+#
+# IMPORTANT: the cilock-ACTION traces with ptrace (it runs the rookery library
+# in-process). For kernel-side eBPF tracing — the full file + network capture —
+# run the cilock BINARY directly with CAP_BPF on a Linux host. See SUPPLY_CHAIN.md
+# → "Local testing (real eBPF)".
+name: supply-chain
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # only needed for the keyless-sigstore option (see below)
+  contents: read
+
+jobs:
+  attested-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # Ephemeral signing key — generated per run, NEVER committed. Keeps this
+      # demo self-contained (no external signing account needed). For real use,
+      # prefer the keyless-sigstore variant documented in SUPPLY_CHAIN.md.
+      - name: Generate ephemeral signing key
+        run: openssl genpkey -algorithm ed25519 -out signing.key
+
+      - name: Attested build (cilock)
+        uses: aflock-ai/cilock-action@v1
+        with:
+          step: build
+          # environment + git + github context, plus a secret scan of the tree.
+          attestations: "environment git github secretscan"
+          trace: "true"                  # ptrace of the build's process tree
+          key: signing.key               # sign with the ephemeral key above
+          enable-sigstore: "false"       # using the file key, not keyless
+          enable-archivista: "false"     # off until the platform free tier is bound
+          outfile: ${{ github.workspace }}/build.attestation.json
+          command: "go build -o bin/hey ."
+
+      # ── Keyless alternative (no key file; signs via GitHub OIDC + Sigstore) ──
+      # Delete the three signing inputs above (key / enable-sigstore /
+      # enable-archivista) to fall back to the action's keyless defaults, which
+      # use the `id-token: write` permission already granted on this job.
+
+      - name: Inspect the signed attestation
+        run: |
+          F=build.attestation.json
+          echo "### cilock attestation" >> "$GITHUB_STEP_SUMMARY"
+          echo "DSSE signatures: $(jq '.signatures | length' "$F")"
+          # The real statement is base64 inside .payload — decode before reading.
+          jq -r .payload "$F" | base64 -d | jq -c '{
+            predicateType,
+            step: .predicate.name,
+            attestations: [.predicate.attestations[].type | sub(".*/attestations/"; "")],
+            processes_traced: ([.predicate.attestations[] | select(.type|test("command-run"))][0].attestation.processes | length)
+          }' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload attestation
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-attestation
+          path: build.attestation.json
