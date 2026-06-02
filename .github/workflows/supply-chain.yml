@@ -39,7 +39,9 @@ jobs:
         run: openssl genpkey -algorithm ed25519 -out signing.key
 
       - name: Attested build (cilock)
-        uses: aflock-ai/cilock-action@v1
+        # Pin to an exact release tag: the floating @v1 tag has no published
+        # release assets yet, so the binary download 404s. Use @v1.0.4.
+        uses: aflock-ai/cilock-action@v1.0.4
         with:
           step: build
           # environment + git + github context, plus a secret scan of the tree.
